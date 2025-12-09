@@ -1,0 +1,4 @@
+liblzf.so.1 liblzf1 #MINVER#
+* Build-Depends-Package: liblzf-dev
+ lzf_compress@Base 1.5
+ lzf_decompress@Base 1.5

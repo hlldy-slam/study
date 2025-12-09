@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+#export DH_VERBOSE = 1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	cp debian/extras/* $(CURDIR)
+	dh_auto_configure --buildsystem=cmake -- \
+		-DBUILD_SHARED_LIBS=ON

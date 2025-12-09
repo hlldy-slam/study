@@ -1,0 +1,1473 @@
+// TOML
+#include "toml.hpp"
+#include "indicators.hpp"
+
+// UFO
+#include <ufo/map/integration/integration.hpp>
+#include <ufo/map/integration/integration_parameters.hpp>
+#include <ufo/map/node.hpp>
+#include <ufo/map/point.hpp>
+#include <ufo/map/point_cloud.hpp>
+#include <ufo/map/points/points_predicate.hpp>
+#include <ufo/map/predicate/satisfies.hpp>
+#include <ufo/map/predicate/spatial.hpp>
+#include <ufo/map/types.hpp>
+#include <ufo/map/ufomap.hpp>
+#include <ufo/math/pose6.hpp>
+#include <ufo/util/timing.hpp>
+
+// STL
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <ios>
+#include <iostream>
+#include <limits>
+#include <random>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <vector>
+
+#ifdef UFO_PARALLEL
+// STL
+#include <execution>
+#endif
+
+#include "json.hpp"
+#include "groud_seg.h"
+#include <Eigen/Dense>
+
+// #include <pcl/common/transforms.h>
+// //#include <pcl/io/pcd_io.h>
+// #include <pcl/point_cloud.h>
+// #include <pcl/point_types.h>
+// #include <pcl/filters/filter.h>
+// #include <pcl/filters/voxel_grid.h>
+// #include <pcl/surface/mls.h>
+// #include <pcl/filters/extract_indices.h>
+// #include <pcl/segmentation/sac_segmentation.h>
+// #include <pcl/filters/statistical_outlier_removal.h>
+
+#include "clean_map.h"
+#include <omp.h>
+#include <mutex>
+
+
+CleanMap::CleanMap(std::string data_root, std::string config_path)
+ {
+    m_data_root = data_root; 
+    m_config_path = config_path;
+
+    m_las_dir = m_data_root + "capture/";
+	m_ply_dir = m_data_root + "ply/";
+	m_ground_dir =  m_data_root + "ground/";
+	m_new_laz_dir = m_data_root + "new_laz/";
+}
+
+CleanMap::~CleanMap() {
+
+}
+
+Config CleanMap::readConfig(std::filesystem::path path)
+{
+	Config config;
+	for (;;) {
+		if (std::filesystem::exists(path)) {
+			toml::table tbl;
+			try {
+				tbl = toml::parse_file((path).string());
+			} catch (toml::parse_error const& err) {
+				std::cerr << "Configuration parsing failed:\n" << err << '\n';
+				exit(1);
+			}
+
+			config.read(tbl);
+			if (config.printing.verbose) {
+				std::cout << "Found: " << (path) << '\n';
+			}
+
+			break;
+		}
+		if (!path.has_parent_path()) {
+			std::cout << "Did not find configuration file, using default.\n";
+			break;
+		}
+		path = path.parent_path();
+	}
+
+	if (config.printing.verbose) {
+		std::cout << config << '\n';
+	}
+
+	return config;
+}
+
+void CleanMap::init(){
+	std::cout << "init begin" << std::endl;
+
+    m_config = readConfig(std::filesystem::path(m_config_path));
+    get_id_sweepLocation(m_map_id_sweepLocation);
+
+   // retainMapRange 从1开始
+	size_t select_m = 0;
+	size_t select_n = m_map_id_sweepLocation.size() - 1;
+
+	if(m_config.fdageParam.select_m >= 0 && m_config.fdageParam.select_n >= 0 
+	&& m_config.fdageParam.select_m <= m_config.fdageParam.select_n){
+		select_m = m_config.fdageParam.select_m;
+		select_n = m_config.fdageParam.select_n;
+	}
+	retainMapRange(m_map_id_sweepLocation, select_m+1, select_n+1);
+	std::cout << "init end" << std::endl;
+}
+
+static std::pair<std::shared_ptr<open3d::geometry::PointCloud>, std::vector<size_t>>
+RemoveStatisticalOutlierOpen3D(const std::shared_ptr<open3d::geometry::PointCloud> &pc,
+                               int nb_neighbors, double std_ratio)
+{
+    if (!pc || pc->points_.empty()) {
+        return {std::make_shared<open3d::geometry::PointCloud>(), {}};
+    }
+
+    // build KDTree
+    open3d::geometry::KDTreeFlann kdtree(*pc);
+
+    size_t n = pc->points_.size();
+    std::vector<double> mean_dists(n, std::numeric_limits<double>::infinity());
+
+    std::vector<int> indices_tmp;
+    std::vector<double> dists_tmp;
+    for (size_t i = 0; i < n; ++i) {
+        // search nb_neighbors+1 to skip the point itself if returned
+        int found = kdtree.SearchKNN(pc->points_[i], nb_neighbors + 1, indices_tmp, dists_tmp);
+        if (found <= 1) {
+            mean_dists[i] = std::numeric_limits<double>::infinity();
+            continue;
+        }
+        // dists_tmp are squared distances in many Open3D versions -> take sqrt
+        double sum = 0.0;
+        int count = 0;
+        for (int k = 0; k < found; ++k) {
+            if (indices_tmp[k] == (int)i) continue; // skip self
+            sum += std::sqrt(dists_tmp[k]);
+            ++count;
+        }
+        if (count > 0) mean_dists[i] = sum / static_cast<double>(count);
+        else mean_dists[i] = std::numeric_limits<double>::infinity();
+    }
+
+    // compute global mean and stddev of mean_dists for valid entries
+    double sum = 0.0;
+    double sumsq = 0.0;
+    size_t valid = 0;
+    for (double v : mean_dists) {
+        if (std::isfinite(v)) {
+            sum += v;
+            sumsq += v * v;
+            ++valid;
+        }
+    }
+    if (valid == 0) {
+        return {std::make_shared<open3d::geometry::PointCloud>(), {}};
+    }
+    double mean = sum / valid;
+    double var = sumsq / valid - mean * mean;
+    double stddev = var > 0.0 ? std::sqrt(var) : 0.0;
+    double threshold = mean + std_ratio * stddev;
+
+    std::vector<size_t> inlier_indices;
+    inlier_indices.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (mean_dists[i] <= threshold) inlier_indices.push_back(i);
+    }
+
+    auto inlier_pc = std::make_shared<open3d::geometry::PointCloud>();
+    inlier_pc->points_.reserve(inlier_indices.size());
+    if (!pc->colors_.empty()) inlier_pc->colors_.reserve(inlier_indices.size());
+    if (!pc->normals_.empty()) inlier_pc->normals_.reserve(inlier_indices.size());
+
+    for (size_t idx : inlier_indices) {
+        inlier_pc->points_.push_back(pc->points_[idx]);
+        if (!pc->colors_.empty()) inlier_pc->colors_.push_back(pc->colors_[idx]);
+        if (!pc->normals_.empty()) inlier_pc->normals_.push_back(pc->normals_[idx]);
+    }
+
+    return {inlier_pc, inlier_indices};
+}
+
+
+void CleanMap::get_id_sweepLocation(std::map<std::string, SweepLocation>&out_map_id_sweepLocation){
+    std::string vision_json_path = m_data_root + "capture/slam_data_new.json";
+
+    // ifstream ifs(vision_json_path, ios::in);
+	// auto j = nlohmann::json::parse(ifs);
+	// ifs.close();
+	/////////////////兼容麒麟v10 aarch64
+nlohmann::json j;
+try {
+	ifstream ifs(vision_json_path, ios::in);
+	j = nlohmann::json::parse(ifs);
+	ifs.close();
+}
+catch (exception e) {
+	j.clear();
+	ifstream ifs(vision_json_path, ios::in);
+	if (char ch = ifs.get(); ch == ' ')
+	{
+		return;
+	}
+	while (ifs.good())
+	{
+		ifs.unget();
+		ifs >> j;
+		ifs.get();
+		break;
+	}
+	ifs.close();
+}
+/////////////////////////
+
+    std::map<std::string, SweepLocation>map_id_sweepLocation;
+
+	for (int floor_index = 0; floor_index < j["views_info"].size(); floor_index++) {
+	    auto& j_floor_ele = j["views_info"][floor_index];
+
+	    int floor_id = j_floor_ele["id_floor"];
+        int location_num = j_floor_ele["list_pose"].size();
+
+		for(int i = 0; i < location_num; i++){
+			auto j_pose =j_floor_ele["list_pose"][i];
+
+			std::string uuid = std::to_string(i);
+
+			//insert map  xx_xx  make key
+			int id0 = floor_id;
+			int id = i;
+
+			std::ostringstream tmp_id0;
+			tmp_id0  << std::setfill('0') << std::setw(6) << id0;
+			std::ostringstream tmp_id;
+			tmp_id  << std::setfill('0') << std::setw(6) << id;
+
+			std::string str_id = tmp_id0.str() + tmp_id.str();
+
+			SweepLocation ele;
+			ele.uuid = uuid;
+			ele.floor_id = floor_id;
+			ele.model_path = m_las_dir + std::to_string(floor_id) + "_" + uuid + "_depth.laz";
+			
+			ele.pose6f.x() = j_pose[4];
+			ele.pose6f.y() = j_pose[5];
+			ele.pose6f.z() = j_pose[6];
+
+			ele.pose6f.qw() = j_pose[0];
+			ele.pose6f.qx() = j_pose[1];
+			ele.pose6f.qy() = j_pose[2];
+			ele.pose6f.qz() = j_pose[3];
+
+			if(std::filesystem::exists(ele.model_path)){
+				map_id_sweepLocation.insert(std::make_pair(str_id, ele));
+			}
+		
+    	}
+	}
+
+    out_map_id_sweepLocation = map_id_sweepLocation;
+}
+
+void CleanMap::retainMapRange(std::map<std::string, SweepLocation>& map, size_t n, size_t m) {
+        if (n > m || m > map.size()) return; // 确保范围有效
+    
+        auto begin_it = std::next(map.begin(), n - 1);
+        auto end_it = std::next(map.begin(), m);
+    
+        map.erase(map.begin(), begin_it);
+        map.erase(end_it, map.end());
+}
+
+void CleanMap::filterGroundPlane_2_open3d(const std::shared_ptr<open3d::geometry::PointCloud> &pc,
+    std::shared_ptr<open3d::geometry::PointCloud> &ground,
+    std::shared_ptr<open3d::geometry::PointCloud> &nonground,
+    double groundFilterDistance,
+    double groundFilterAngle) {
+    if (!pc || pc->points_.size() < 50) {
+        std::cout << "Pointcloud too small, skipping ground plane extraction\n";
+        nonground = pc;
+        return;
+    }
+
+    // 估计法线（如果没有）
+    if (pc->normals_.empty()) {
+        pc->EstimateNormals(open3d::geometry::KDTreeSearchParamKNN(30));
+    }
+
+    // RANSAC 平面分割
+    int ransac_n = 3;
+    int num_iterations = 1000;
+    double distance_threshold = groundFilterDistance;
+    Eigen::Vector4d plane_model;
+    std::vector<size_t> inliers;
+    std::tie(plane_model, inliers) = pc->SegmentPlane(distance_threshold, ransac_n, num_iterations);
+
+    if (inliers.empty()) {
+        std::cout << "Open3D segmentation did not find any plane.\n";
+        nonground = pc;
+        return;
+    }
+
+    // 判断分割出的平面法线是否和期望地面轴接近（示例中期望轴为 Y 方向 (0,1,0)）
+    Eigen::Vector3d plane_normal = plane_model.head<3>();
+    plane_normal.normalize();
+    Eigen::Vector3d axis(0.0, 1.0, 0.0); // 原 PCL 代码使用 (0,1,0)
+    double angle = std::acos(std::abs(plane_normal.dot(axis))); // 0..pi/2
+    if (angle > groundFilterAngle) {
+        // 不是期望方向的平面 -> 视为未找到地面
+        std::cout << "Found plane but angle too large, skipping as ground.\n";
+        nonground = pc;
+        return;
+    }
+
+    // SelectDownSample 在不同版本可能返回 PointCloud（按值）或 shared_ptr<PointCloud>，兼容两种情况
+    auto tmp_ground = pc->SelectDownSample(inliers);
+    using TmpGroundT = std::decay_t<decltype(tmp_ground)>;
+    if constexpr (std::is_same_v<TmpGroundT, std::shared_ptr<open3d::geometry::PointCloud>>) {
+        ground = tmp_ground;
+    } else {
+            ground = std::make_shared<open3d::geometry::PointCloud>(std::move(tmp_ground));
+    }
+
+    // nonground：构造索引补集，然后用 SelectDownSample
+    std::vector<char> is_inlier(pc->points_.size(), 0);
+    for (auto idx : inliers) {
+        if (idx < is_inlier.size()) is_inlier[idx] = 1;
+    }
+    std::vector<size_t> complement;
+    complement.reserve(pc->points_.size() - inliers.size());
+    for (size_t i = 0; i < is_inlier.size(); ++i) {
+        if (!is_inlier[i]) complement.push_back(i);
+    }
+
+    auto tmp_nonground = pc->SelectDownSample(complement);
+    using TmpNonGroundT = std::decay_t<decltype(tmp_nonground)>;
+    if constexpr (std::is_same_v<TmpNonGroundT, std::shared_ptr<open3d::geometry::PointCloud>>) {
+        nonground = tmp_nonground;
+    } else {
+        nonground = std::make_shared<open3d::geometry::PointCloud>(std::move(tmp_nonground));
+    }	
+}
+
+
+// void CleanMap::filterGroundPlane_2(pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr const& pc,
+// 	pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr& ground,
+// 	pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr& nonground,
+// 	double groundFilterDistance,
+// 	double groundFilterAngle) {
+// 	if (pc->size() < 50) {
+// 		cout << "Pointcloud in OctomapServer too small, skipping ground plane extraction";
+// 		nonground = pc;
+// 		return;
+// 	}
+
+// 	// plane detection for ground plane removal:
+// 	pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+// 	pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+
+// 	// Create the segmentation object and set up:
+// 	pcl::SACSegmentation<pcl::PointXYZRGBNormal> seg;
+// 	seg.setOptimizeCoefficients(true);
+
+// 	seg.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
+// 	seg.setMethodType(pcl::SAC_RANSAC);
+// 	seg.setDistanceThreshold(groundFilterDistance);
+// 	//seg.setAxis(Eigen::Vector3f(0, 0, 1));
+// 	seg.setAxis(Eigen::Vector3f(0, 1, 0));
+// 	seg.setEpsAngle(groundFilterAngle);
+
+// 	// Create the filtering object
+// 	seg.setInputCloud(pc);
+// 	seg.segment(*inliers, *coefficients);
+// 	if (inliers->indices.size() == 0) {
+// 		cout << "PCL segmentation did not find any plane.";
+// 		nonground = pc;
+// 		return;
+// 	}
+// 	pcl::ExtractIndices<pcl::PointXYZRGBNormal> extract;
+// 	bool groundPlaneFound = false;
+// 	extract.setInputCloud(pc);
+// 	extract.setIndices(inliers);
+// 	extract.setNegative(false);
+// 	extract.filter(*ground);
+// 	if (inliers->indices.size() != pc->size()) {
+// 		extract.setNegative(true);
+// 		pcl::PointCloud<pcl::PointXYZRGBNormal> cloud_out;
+// 		extract.filter(cloud_out);
+
+// 		*nonground += cloud_out;
+// 	}
+// }
+
+
+// void CleanMap::filterGroundPlane(pcl::PointCloud<pcl::PointXYZRGB>::Ptr const& pc,
+// 	pcl::PointCloud<pcl::PointXYZRGB>::Ptr& ground,
+// 	pcl::PointCloud<pcl::PointXYZRGB>::Ptr& nonground,
+// 	double groundFilterDistance,
+// 	double groundFilterAngle) {
+// 	if (pc->size() < 50) {
+// 		cout << "Pointcloud in OctomapServer too small, skipping ground plane extraction";
+// 		nonground = pc;
+// 		return;
+// 	}
+
+// 	// plane detection for ground plane removal:
+// 	pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+// 	pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+
+// 	// Create the segmentation object and set up:
+// 	pcl::SACSegmentation<pcl::PointXYZRGB> seg;
+// 	seg.setOptimizeCoefficients(true);
+
+// 	seg.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
+// 	seg.setMethodType(pcl::SAC_RANSAC);
+// 	seg.setDistanceThreshold(groundFilterDistance);
+// 	seg.setAxis(Eigen::Vector3f(0, 0, 1));
+// 	seg.setEpsAngle(groundFilterAngle);
+
+// 	// Create the filtering object
+// 	seg.setInputCloud(pc);
+// 	seg.segment(*inliers, *coefficients);
+// 	if (inliers->indices.size() == 0) {
+// 		cout << "PCL segmentation did not find any plane.";
+// 		nonground = pc;
+// 		return;
+// 	}
+// 	pcl::ExtractIndices<pcl::PointXYZRGB> extract;
+// 	bool groundPlaneFound = false;
+// 	extract.setInputCloud(pc);
+// 	extract.setIndices(inliers);
+// 	extract.setNegative(false);
+// 	extract.filter(*ground);
+// 	if (inliers->indices.size() != pc->size()) {
+// 		extract.setNegative(true);
+// 		pcl::PointCloud<pcl::PointXYZRGB> cloud_out;
+// 		extract.filter(cloud_out);
+// 		*nonground += cloud_out;
+// 	}
+// }
+
+void CleanMap::filterNoise_open3d(ufo::PointCloudColor &cloud, ufo::PointCloudColor &out_cloud_noise, Potree::AABB &out_aabb)
+{
+    // 构造 open3d 点云（跳过 NaN/inf）
+    auto o3d_pc = std::make_shared<open3d::geometry::PointCloud>();
+    o3d_pc->points_.reserve(cloud.size());
+    bool has_color = true;
+    for (size_t i = 0; i < cloud.size(); ++i) {
+        double x = cloud[i].x;
+        double y = cloud[i].y;
+        double z = cloud[i].z;
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+        o3d_pc->points_.push_back(Eigen::Vector3d(x, y, z));
+        // color in ufo is 0..255
+        o3d_pc->colors_.push_back(Eigen::Vector3d(cloud[i].red/255.0, cloud[i].green/255.0, cloud[i].blue/255.0));
+    }
+
+    // 如果点云为空，直接返回空结果
+    if (o3d_pc->points_.empty()) {
+        out_aabb = Potree::AABB();
+        cloud.clear();
+        out_cloud_noise.clear();
+        return;
+    }
+
+    bool filterNoise = m_config.filterNoise.enable;
+    std::shared_ptr<open3d::geometry::PointCloud> inlier_pc;
+    std::vector<size_t> inlier_indices;
+
+    if (filterNoise) {
+        int mean_k = m_config.filterNoise.filterMeanK;
+        double std_ratio = m_config.filterNoise.StddevMulThresh;
+        std::tie(inlier_pc, inlier_indices) = RemoveStatisticalOutlierOpen3D(o3d_pc, mean_k, std_ratio);
+    } else {
+        // 不做统计去噪，只去除非有限点（已经在构建时跳过）
+        inlier_pc = o3d_pc;
+        inlier_indices.resize(inlier_pc->points_.size());
+        for (size_t i = 0; i < inlier_indices.size(); ++i) inlier_indices[i] = i;
+    }
+
+    // 生成噪声点 (补集)
+    std::vector<char> is_inlier(o3d_pc->points_.size(), 0);
+    for (auto idx : inlier_indices) if (idx < is_inlier.size()) is_inlier[idx] = 1;
+    std::vector<size_t> noise_indices;
+    noise_indices.reserve(o3d_pc->points_.size() - inlier_indices.size());
+    for (size_t i = 0; i < is_inlier.size(); ++i) if (!is_inlier[i]) noise_indices.push_back(i);
+
+    // 把 inlier_pc 转回 ufo::PointCloudColor 并更新 out_aabb
+    ufo::PointCloudColor out_cloud(inlier_pc->points_.size());
+    for (size_t i = 0; i < inlier_pc->points_.size(); ++i) {
+        const auto &p = inlier_pc->points_[i];
+        out_cloud[i].x = p.x();
+        out_cloud[i].y = p.y();
+        out_cloud[i].z = p.z();
+        if (!inlier_pc->colors_.empty()) {
+            out_cloud[i].red   = static_cast<unsigned char>(std::clamp(int(std::round(inlier_pc->colors_[i].x()*255.0)), 0, 255));
+            out_cloud[i].green = static_cast<unsigned char>(std::clamp(int(std::round(inlier_pc->colors_[i].y()*255.0)), 0, 255));
+            out_cloud[i].blue  = static_cast<unsigned char>(std::clamp(int(std::round(inlier_pc->colors_[i].z()*255.0)), 0, 255));
+        } else {
+            out_cloud[i].red = out_cloud[i].green = out_cloud[i].blue = 255;
+        }
+        Potree::Vector3<double> pt_tmp(out_cloud[i].x, out_cloud[i].y, out_cloud[i].z);
+        out_aabb.update(pt_tmp);
+    }
+    cloud = out_cloud;
+
+    // 构造噪声点云返回
+    ufo::PointCloudColor out_noise(noise_indices.size());
+    for (size_t k = 0; k < noise_indices.size(); ++k) {
+        size_t idx = noise_indices[k];
+        const auto &p = o3d_pc->points_[idx];
+        out_noise[k].x = p.x();
+        out_noise[k].y = p.y();
+        out_noise[k].z = p.z();
+        if (!o3d_pc->colors_.empty()) {
+            out_noise[k].red   = static_cast<unsigned char>(std::clamp(int(std::round(o3d_pc->colors_[idx].x()*255.0)), 0, 255));
+            out_noise[k].green = static_cast<unsigned char>(std::clamp(int(std::round(o3d_pc->colors_[idx].y()*255.0)), 0, 255));
+            out_noise[k].blue  = static_cast<unsigned char>(std::clamp(int(std::round(o3d_pc->colors_[idx].z()*255.0)), 0, 255));
+        } else {
+            out_noise[k].red = out_noise[k].green = out_noise[k].blue = 0;
+        }
+    }
+    out_cloud_noise = out_noise;
+}
+
+// void CleanMap::filterNoise(ufo::PointCloudColor &cloud, ufo::PointCloudColor &out_cloud_noise, Potree::AABB &out_aabb)
+// {
+// 	pcl::PointCloud<pcl::PointXYZRGB>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+// 		for(int i = 0; i < cloud.size(); i++){
+// 			pcl::PointXYZRGB pt;
+// 			pt.x = cloud[i].x;
+// 			pt.y = cloud[i].y;
+// 			pt.z = cloud[i].z;
+// 			pt.r = cloud[i].red;
+// 			pt.g =  cloud[i].green;
+// 			pt.b =  cloud[i].blue;
+
+// 			pcl_cloud->push_back(pt);
+// 		}
+
+// 		///// 仿照octomap 数据处理
+// 		bool filterNoise = m_config.filterNoise.enable;  // 去噪filterNoise
+// 		pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZRGB>);
+// 		pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_noise(new pcl::PointCloud<pcl::PointXYZRGB>);
+// 		if (filterNoise) {
+// 			pcl::StatisticalOutlierRemoval<pcl::PointXYZRGB> sor(true);
+// 			sor.setInputCloud(pcl_cloud);
+// 			sor.setMeanK(m_config.filterNoise.filterMeanK);
+// 			sor.setStddevMulThresh(m_config.filterNoise.StddevMulThresh);
+// 			sor.filter(*cloud_filtered);
+
+// 			pcl::IndicesConstPtr remove_index = sor.getRemovedIndices();
+// 			const int* idx_ptr = &(*remove_index)[0];
+// 			size_t num = remove_index->size();
+
+// 			if(num > 0){
+// 				sor.setNegative(true);
+// 				sor.filter(*cloud_noise);
+// 			}
+			
+// 		}
+// 		else {
+// 			// remove NaN points
+// 			std::vector<int> indices;
+// 			pcl::removeNaNFromPointCloud(*pcl_cloud, *cloud_filtered, indices);
+// 		}
+
+// 		ufo::PointCloudColor out_cloud(cloud_filtered->size());
+// 		for(int i = 0; i < cloud_filtered->points.size(); i++){
+// 				double x = cloud_filtered->points[i].x;
+// 				double y = cloud_filtered->points[i].y;
+// 				double z = cloud_filtered->points[i].z;
+
+// 				out_cloud[i].x = x;
+// 				out_cloud[i].y = y;
+// 				out_cloud[i].z = z;
+
+// 				Potree::Vector3<double> pt_tmp(x, y, z);
+//                 out_aabb.update(pt_tmp);
+// 		}
+
+// 		cloud = out_cloud;
+
+// 		ufo::PointCloudColor out_cloud_noise_tmp(cloud_noise->size());
+// 		for(int i = 0; i < cloud_noise->points.size(); i++){
+// 				double x = cloud_noise->points[i].x;
+// 				double y = cloud_noise->points[i].y;
+// 				double z = cloud_noise->points[i].z;
+
+// 				out_cloud_noise_tmp[i].x = x;
+// 				out_cloud_noise_tmp[i].y = y;
+// 				out_cloud_noise_tmp[i].z = z;
+// 		}
+// 		out_cloud_noise = out_cloud_noise_tmp;
+
+// }
+
+void CleanMap::get_camera_traj(ufo::PointCloudColor &cloud_camera_traj, cv::Mat &out_pointsA)
+{
+		int loc_num = m_map_id_sweepLocation.size();
+		ufo::PointCloudColor cloud_camera_traj_tmp(loc_num);
+
+		int i = 0;
+		// cv::Mat pointsA(loc_num, 3, CV_32F);
+
+		for(auto& pair:m_map_id_sweepLocation){
+		SweepLocation ele = pair.second;
+		std::string las_path = ele.model_path;
+		ufo::Pose6f viewpoint = ele.pose6f;
+
+		double x = viewpoint.translation.x;
+		double y = viewpoint.translation.y;
+		double z = viewpoint.translation.z;
+
+		cloud_camera_traj_tmp[i].x = x; 
+		cloud_camera_traj_tmp[i].y = y;
+		cloud_camera_traj_tmp[i].z = z;
+
+		cloud_camera_traj_tmp[i].red   = 255;
+		cloud_camera_traj_tmp[i].green   =0;
+		cloud_camera_traj_tmp[i].blue   = 255;
+
+		out_pointsA.at<float>(i, 0) = x;
+		 out_pointsA.at<float>(i, 1) = y; 
+		 out_pointsA.at<float>(i, 2) = z;
+
+		i++;
+	}
+
+	cloud_camera_traj = cloud_camera_traj_tmp;
+}
+
+void CleanMap::run(){
+	auto begin_t = high_resolution_clock::now();
+
+	cv::Mat pointsA(m_map_id_sweepLocation.size(), 3, CV_32F);
+	ufo::PointCloudColor cloud_camera_traj;
+
+	get_camera_traj(cloud_camera_traj, pointsA);
+	cv::flann::Index flannIndex = cv::flann::Index(pointsA, cv::flann::KDTreeIndexParams(4));
+
+
+	ufo::Map<ufo::MapType::SEEN_FREE | ufo::MapType::REFLECTION | ufo::MapType::LABEL> map(
+	    m_config.map.resolution, m_config.map.levels);
+	map.reserve(100'000'000);
+
+	ufo::PointCloudColor cloud_acc_noise;
+	Potree::AABB all_aabb;
+	//pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr all_pc_ground(new pcl::PointCloud<pcl::PointXYZRGBNormal>);
+	std::mutex mtx;
+
+	int num_location = m_map_id_sweepLocation.size();
+	int i = 0;
+	ufo::Timing timing;
+	timing.start("Total");
+
+	std::random_device                          rd;
+	std::mt19937                                gen(rd());
+	std::uniform_int_distribution<> dis(0, 255);
+
+	std::vector<SweepLocation>vec_sweepLocation;
+	for(auto& pair:m_map_id_sweepLocation){
+		SweepLocation &ele = pair.second;
+		vec_sweepLocation.push_back(ele);
+	}
+
+#pragma omp parallel for
+	//for(auto& pair:m_map_id_sweepLocation)
+	for(int loc_index = 0; loc_index < vec_sweepLocation.size(); loc_index++)
+	{
+		//SweepLocation ele = pair.second;
+		SweepLocation ele = vec_sweepLocation[loc_index];
+		std::string las_path = ele.model_path;
+		ufo::Pose6f viewpoint = ele.pose6f;
+
+		i++;
+		if(i>1 && !m_config.printing.verbose){
+            std::ostringstream log_msg;
+            log_msg << "(" << i << "/" << num_location << ") Processing: " << ele.uuid << " Time Cost: " 
+                << m_config.integration.timing.lastSeconds() << "s";
+            std::string spaces(10, ' ');
+            log_msg << spaces;
+            std::cout << "\r" <<log_msg.str() << std::flush;
+        }
+
+		// 随机着色
+		ufo::Color color;
+		color.red = dis(gen);
+		color.green = dis(gen);
+		color.blue = dis(gen);
+
+		ufo::PointCloudColor cloud;		
+		Potree::AABB aabb;
+		ufo::readPointCloudLAZ(las_path, cloud, aabb, color);
+		
+		ufo::applyTransform(cloud, viewpoint);
+		std::cout << "filterNoise before: " << cloud.size() << std::endl;
+		ufo::PointCloudColor cloud_noise;
+
+		if(m_config.filterNoise.enable){
+			//filterNoise(cloud, cloud_noise, aabb);  // 去燥		PCL
+			filterNoise_open3d(cloud, cloud_noise, aabb);	// 去燥   Open3D
+			cloud_acc_noise.insert(cloud_acc_noise.cend(), cloud_noise.cbegin(), cloud_noise.cend());
+		}
+		
+		all_aabb.update(aabb);
+		std::cout << "filterNoise after: " << cloud.size() << std::endl;
+		std::cout << "cloud_noise size: " << cloud_noise.size() << std::endl;
+
+		{
+			std::lock_guard<std::mutex> guard(mtx);
+			ufo::insertPointCloud(map, cloud, viewpoint.translation, m_config.integration,
+		                      m_config.propagate);
+		}
+		
+		if (m_config.printing.verbose) {
+			timing.setTag("Total " + std::to_string(i) + " of " + std::to_string(num_location) +
+						" (" + std::to_string(100 * i / num_location) + "%)");
+			timing[2] = m_config.integration.timing;
+			timing.print(true, true, 2, 4);
+		}
+	}
+
+	auto build_map_end = high_resolution_clock::now();
+	long long duration_map = duration_cast<milliseconds>(build_map_end - begin_t).count();
+	float seconds_map = duration_map / 1'000.0f;
+	std::cout << "build map cost: " << seconds_map << "s" << std::endl;
+
+	// query
+	ufo::PointCloudColor cloud_static;
+    ufo::PointCloudColor cloud_remove;
+	ufo::PointCloudColor cloud_acc_ground;
+
+	////////////////
+	// for (auto& p : cloud_acc_noise)
+	// {
+	// 	if (!map.seenFree(p))
+	// 	{
+	// 		std::cout << "noise static" << std::endl;
+	// 	}else{
+		
+	// 	}
+	// }
+	////////////////
+
+#ifdef _OPENMP 
+	std::cout << "use openmp" << std::endl;
+	//omp_set_num_threads(8);
+	//omp_set_nested(1);//设置支持嵌套并行
+	//omp_lock_t lock;
+	//omp_init_lock(&lock);
+#endif
+#pragma omp parallel for
+	//for(auto& pair:m_map_id_sweepLocation)
+	for(int loc_index = 0; loc_index < vec_sweepLocation.size(); loc_index++)
+	{
+		//SweepLocation ele = pair.second;
+		SweepLocation ele = vec_sweepLocation[loc_index];
+		std::string las_path = ele.model_path;
+		ufo::Pose6f viewpoint = ele.pose6f;
+
+		// 随机着色
+		ufo::Color color;
+		color.red = dis(gen);
+		color.green = dis(gen);
+		color.blue = dis(gen);
+
+		ufo::PointCloudColor cloud;		
+		Potree::AABB aabb;
+		ufo::readPointCloudLAZ(las_path, cloud, aabb, color);
+
+		ufo::PointCloudColor cloud_noise;
+		if(m_config.filterNoise.enable){
+			//filterNoise(cloud, cloud_noise, aabb);  // 去燥 PCL
+			filterNoise_open3d(cloud, cloud_noise, aabb);  // 去燥 Open3D
+			ufo::applyTransform(cloud_noise, viewpoint);
+			cloud_remove.insert(cloud_remove.cend(), cloud_noise.cbegin(), cloud_noise.cend());
+		}
+		
+		size_t numPoints = cloud.size();
+
+		std::vector<Potree::Point> vec_points(numPoints);
+
+		for(int i = 0; i < numPoints; i++){
+			Potree::Point point;
+			point.position.x = cloud[i].x;
+			point.position.y = cloud[i].y;
+			point.position.z = cloud[i].z;
+
+			point.color.x = cloud[i].red;
+			point.color.y = cloud[i].green;
+			point.color.z = cloud[i].blue;
+
+			vec_points[i] = point;
+		}
+
+
+		////
+		// pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr pc_nonground(new pcl::PointCloud<pcl::PointXYZRGBNormal>);
+		// pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr pc_ground(new pcl::PointCloud<pcl::PointXYZRGBNormal>);
+	   //pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr static_cut_nonground(new pcl::PointCloud<pcl::PointXYZRGBNormal>);
+
+		//open3d 代替
+	   	auto pc_nonground = std::make_shared<open3d::geometry::PointCloud>();
+		auto pc_ground = std::make_shared<open3d::geometry::PointCloud>();
+
+		// 过滤地面
+		bool bfilterGroundPlane =  m_config.groundSeg.enable;
+		//bfilterGroundPlane = false;
+		if (bfilterGroundPlane) 
+		{
+			// pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr cloud_cut_ground(new pcl::PointCloud<pcl::PointXYZRGBNormal>);
+			// pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr cloud_cut_nonground(new pcl::PointCloud<pcl::PointXYZRGBNormal>);
+			// ufo::PointCloudColor cloud_cut;
+			// std::vector<float>  vec_cloud_cut;
+
+			//open3d
+			auto cloud_cut_ground = std::make_shared<open3d::geometry::PointCloud>();
+			auto cloud_cut_nonground = std::make_shared<open3d::geometry::PointCloud>();
+			std::vector<float>  vec_cloud_cut;			
+
+			for(int i = 0; i < vec_points.size(); i++){
+				float z =  vec_points[i].position.z;
+				// pcl::PointXYZRGBNormal pt;
+				// pt.x = vec_points[i].position.x;
+				// pt.y = vec_points[i].position.y;
+				// pt.z = vec_points[i].position.z;
+				// pt.r = color.red;
+				// pt.g = color.green;
+				// pt.b = color.blue;
+				// pt.normal_x = vec_points[i].normal.x;
+				// pt.normal_y = vec_points[i].normal.y;
+				// pt.normal_z = vec_points[i].normal.z;
+
+				Eigen::Vector3d p3(vec_points[i].position.x, vec_points[i].position.y, vec_points[i].position.z);
+				Eigen::Vector3d c3(color.red/255.0, color.green/255.0, color.blue/255.0);
+				Eigen::Vector3d n3(vec_points[i].normal.x, vec_points[i].normal.y, vec_points[i].normal.z);
+ 
+
+				double y_min = -m_config.groundSeg.ground_max_z;
+				double y_max = -m_config.groundSeg.ground_min_z;
+				// if(y_min < pt.y && pt.y < y_max){
+				// 	cloud_cut_ground->push_back(pt);		
+				// 	ufo::PointCloudColor pt;
+				// 	pt.resize(1);
+				// 	pt[0].x = vec_points[i].position.x;
+				// 	pt[0].y = vec_points[i].position.y;
+				// 	pt[0].z = vec_points[i].position.z;
+
+				// 	//cloud_cut.push_back(pt[0]);
+				// 	vec_cloud_cut.push_back(vec_points[i].position.x);
+				// 	vec_cloud_cut.push_back(vec_points[i].position.y);
+				// 	vec_cloud_cut.push_back(vec_points[i].position.z);
+				// }else{
+				// 	cloud_cut_nonground->push_back(pt);	
+				// 	//static_cut_nonground->push_back(pt); // 范围外保留
+				// }
+
+				if(y_min < p3.y() && p3.y() < y_max){
+					cloud_cut_ground->points_.push_back(p3);
+					cloud_cut_ground->colors_.push_back(Eigen::Vector3d(1.0, 0.0, 0.0)); // 标红便于调试
+					cloud_cut_ground->normals_.push_back(n3);
+
+					vec_cloud_cut.push_back(vec_points[i].position.x);
+					vec_cloud_cut.push_back(vec_points[i].position.y);
+					vec_cloud_cut.push_back(vec_points[i].position.z);
+				}else{
+					cloud_cut_nonground->points_.push_back(p3);
+					cloud_cut_nonground->colors_.push_back(c3);
+					cloud_cut_nonground->normals_.push_back(n3);
+                 	}
+			}
+
+			////
+			//string ground_ply_path = m_ground_dir + std::to_string(ele.floor_id) + "_" + ele.uuid + "_src.ply";
+			//ufo::writePointCloudPLY_downsample(ground_ply_path, cloud_cut, 0.01, 0.01, 0.01);
+			
+			///
+
+			double groundFilterDistance = m_config.groundSeg.distance;
+			double groundFilterAngle = m_config.groundSeg.angle;
+			// filterGroundPlane(cloud_cut_ground, pc_ground, pc_nonground, groundFilterDistance, groundFilterAngle);
+			//filterGroundPlane_2(cloud_cut_ground, pc_ground, pc_nonground, groundFilterDistance, groundFilterAngle);
+			//*pc_nonground +=  *cloud_cut_nonground;  // pc_nonground 会放去图中判断是否应该去除
+
+			if (bfilterGroundPlane)
+			{
+				Groud_seg groud_seg = Groud_seg();
+				string ground_ply_path = m_ground_dir + std::to_string(ele.floor_id) + "_" + ele.uuid + "_my.ply";
+				std::vector<float>  out_ground_cloud;
+				std::vector<float>  out_non_ground_cloud;
+				groud_seg.groud_seg_my(vec_cloud_cut, out_ground_cloud, out_non_ground_cloud, "");
+
+				// for(int j = 0; j < out_ground_cloud.size()/3; j++){
+				// 		pcl::PointXYZRGBNormal pt;
+				// 		pt.x = out_ground_cloud[3*j];
+				// 		pt.y = out_ground_cloud[3*j + 1];
+				// 		pt.z = out_ground_cloud[3*j + 2];
+
+				// 		pc_ground->points.push_back(pt);
+				// }
+
+				// for(int j = 0; j < out_non_ground_cloud.size()/3; j++){
+				// 		pcl::PointXYZRGBNormal pt;
+				// 		pt.x = out_non_ground_cloud[3*j];
+				// 		pt.y = out_non_ground_cloud[3*j + 1];
+				// 		pt.z = out_non_ground_cloud[3*j + 2];
+				// 		pt.r = color.red;
+				// 		pt.g = color.green;
+				// 		pt.b = color.blue;
+				// 		pc_nonground->points.push_back(pt);
+				// }
+
+				// *pc_nonground +=  *cloud_cut_nonground;
+
+				// 将 groud_seg 输出转换到 Open3D 点云
+				for(size_t j = 0; j < out_ground_cloud.size()/3; j++){
+						Eigen::Vector3d p(out_ground_cloud[3*j], out_ground_cloud[3*j + 1], out_ground_cloud[3*j + 2]);
+						pc_ground->points_.push_back(p);
+						pc_ground->colors_.push_back(Eigen::Vector3d(1.0, 0.0, 0.0));
+				}
+
+				for(size_t j = 0; j < out_non_ground_cloud.size()/3; j++){
+						Eigen::Vector3d p(out_non_ground_cloud[3*j], out_non_ground_cloud[3*j + 1], out_non_ground_cloud[3*j + 2]);
+						pc_nonground->points_.push_back(p);
+						pc_nonground->colors_.push_back(Eigen::Vector3d(color.red/255.0, color.green/255.0, color.blue/255.0));
+				}
+
+				// 把 cloud_cut_nonground 的点追加到 pc_nonground
+				pc_nonground->points_.insert(pc_nonground->points_.end(),
+				                             cloud_cut_nonground->points_.begin(), cloud_cut_nonground->points_.end());
+				if (!cloud_cut_nonground->colors_.empty()) {
+					pc_nonground->colors_.insert(pc_nonground->colors_.end(),
+					                             cloud_cut_nonground->colors_.begin(), cloud_cut_nonground->colors_.end());
+				}
+				if (!cloud_cut_nonground->normals_.empty()) {
+					pc_nonground->normals_.insert(pc_nonground->normals_.end(),
+					                              cloud_cut_nonground->normals_.begin(), cloud_cut_nonground->normals_.end());
+				}
+			}
+				
+			//save the pcd ground
+			//if (pc_ground->points.size() > 0 && m_config.fdageParam.output_map) //PCL
+			if (pc_ground->points_.size() > 0 && m_config.fdageParam.output_map) //open3d
+			{
+				std::cout << "find ground." << std::endl;
+				
+				std::ostringstream tmp_filename;
+				tmp_filename << m_data_root + "ground/" << ele.uuid << ".ply";
+				std::string pcd_file = tmp_filename.str(); 
+					
+				//pcl::io::savePCDFileBinary(pcd_file, *pc_ground);
+				{
+					// std::vector<Potree::Point> vec_points_ground((*pc_ground).size());
+					// ufo::PointCloudColor cloud_ground_tmp;
+					// cloud_ground_tmp.resize((*pc_ground).size());
+
+					// int ii = 0;
+					// for(auto &p :  pc_ground->points)
+					// {
+					// 	double x = p.x;
+					// 	double y = p.y;
+					// 	double z = p.z;
+
+					// 	Potree::Point point;
+					// 	point.position.x = x;
+					// 	point.position.y = y;
+					// 	point.position.z = z;
+
+					// 	point.normal.x = p.normal_x;
+					// 	point.normal.y = p.normal_y;
+					// 	point.normal.z = p.normal_z;
+
+					// 	point.color.x = 255;
+					// 	point.color.y = 0;
+					// 	point.color.z = 0;
+					// 	vec_points_ground[ii] = point;
+
+					// 	cloud_ground_tmp[ii].x = x;
+					// 	cloud_ground_tmp[ii].y = y;
+					// 	cloud_ground_tmp[ii].z = z;
+
+					// 	cloud_ground_tmp[ii].red   = 255;
+					// 	cloud_ground_tmp[ii].green   = 0;
+					// 	cloud_ground_tmp[ii].blue   = 0;
+
+					// 	ii++;
+					// }
+
+					std::vector<Potree::Point> vec_points_ground(pc_ground->points_.size());
+					ufo::PointCloudColor cloud_ground_tmp;
+					cloud_ground_tmp.resize(pc_ground->points_.size());
+
+					for(size_t ii = 0; ii < pc_ground->points_.size(); ++ii)
+					{
+						const auto &p = pc_ground->points_[ii];
+						Eigen::Vector3d normal = pc_ground->normals_.empty() ? Eigen::Vector3d(0,0,0) : pc_ground->normals_[ii];
+
+						Potree::Point point;
+						point.position.x = p.x();
+						point.position.y = p.y();
+						point.position.z = p.z();
+
+						point.normal.x = normal.x();
+						point.normal.y = normal.y();
+						point.normal.z = normal.z();
+
+						point.color.x = 255;
+						point.color.y = 0;
+						point.color.z = 0;
+						vec_points_ground[ii] = point;
+
+						cloud_ground_tmp[ii].x = p.x();
+						cloud_ground_tmp[ii].y = p.y();
+						cloud_ground_tmp[ii].z = p.z();
+
+						cloud_ground_tmp[ii].red   = 255;
+						cloud_ground_tmp[ii].green = 0;
+						cloud_ground_tmp[ii].blue  = 0;
+					}
+
+					//ufo::writePointCloudPLY_bin(pcd_file, vec_points_ground);				
+					{
+						std::lock_guard<std::mutex> guard(mtx);
+						ufo::applyTransform(cloud_ground_tmp, viewpoint );
+						cloud_acc_ground.insert(std::end(cloud_acc_ground), std::cbegin(cloud_ground_tmp), std::cend(cloud_ground_tmp));
+
+						string ground_ply_path = m_ground_dir + std::to_string(ele.floor_id) + "_" + ele.uuid + ".ply";
+						//ufo::writePointCloudPLY_downsample(ground_ply_path, cloud_ground_tmp, 0.01, 0.01, 0.01);
+					}			
+				}
+			}		
+		}
+		else{
+			// for(int i = 0; i < vec_points.size(); i++){
+			// 	float z =  vec_points[i].position.z;
+			// 	pcl::PointXYZRGBNormal pt;
+			// 	pt.x = vec_points[i].position.x;
+			// 	pt.y = vec_points[i].position.y;
+			// 	pt.z = vec_points[i].position.z;
+			// 	pt.r = color.red;
+			// 	pt.g = color.green;
+			// 	pt.b = color.blue;
+			// 	pt.normal_x = vec_points[i].normal.x;
+			// 	pt.normal_y = vec_points[i].normal.y;
+			// 	pt.normal_z = vec_points[i].normal.z;
+
+			// 	pc_nonground->push_back(pt);
+			// }
+
+			for(size_t i = 0; i < vec_points.size(); ++i){
+				Eigen::Vector3d p3(vec_points[i].position.x, vec_points[i].position.y, vec_points[i].position.z);
+				pc_nonground->points_.push_back(p3);
+				pc_nonground->colors_.push_back(Eigen::Vector3d(color.red/255.0, color.green/255.0, color.blue/255.0));
+				pc_nonground->normals_.push_back(Eigen::Vector3d(vec_points[i].normal.x, vec_points[i].normal.y, vec_points[i].normal.z));
+			}
+		}
+
+		////
+
+		auto r = viewpoint.rotation.rotMatrix();
+		auto t =  viewpoint.translation;
+		ufo::PointCloudColor pt;
+		pt.resize(1);
+		
+		std::vector<Potree::Point> vec_points_static;
+		std::vector<Potree::Point> vec_points_remove;
+		Potree::AABB static_point_aabb;
+
+		// PCL
+		// for(auto &p :  pc_ground->points){
+		// 	double x = p.x;
+		// 	double y = p.y;
+		// 	double z = p.z;
+
+		// 	Potree::Point point;
+		// 	point.position.x = x;
+		// 	point.position.y = y;
+		// 	point.position.z = z;
+
+		// 	point.normal.x = p.normal_x;
+		// 	point.normal.y = p.normal_y;
+		// 	point.normal.z = p.normal_z;
+
+		// 	point.color.x = 255;
+		// 	point.color.y = 255;
+		// 	point.color.z = 0;
+
+		// 	vec_points_static.push_back(point);	
+
+		// 	Potree::Vector3<double> pt_tmp(x, y, z);
+        //     static_point_aabb.update(pt_tmp);
+
+		// 	if(m_config.fdageParam.output_map){
+		// 		std::lock_guard<std::mutex> guard(mtx);
+		// 		pt[0].x   = r[0] * x + r[1] * y + r[2] * z + t.x;
+		// 		pt[0].y   = r[3] * x + r[4] * y + r[5] * z + t.y;
+		// 		pt[0].z    = r[6] * x + r[7] * y + r[8] * z + t.z;
+
+		// 		pt[0].red = 255;
+		// 		pt[0].green = 255;
+		// 		pt[0].blue = 0;
+		// 		cloud_static.push_back(pt[0]);   
+		// 	}
+		// }
+
+		for(size_t ip = 0; ip < pc_ground->points_.size(); ++ip){
+			const auto &p = pc_ground->points_[ip];
+			Eigen::Vector3d normal = pc_ground->normals_.empty() ? Eigen::Vector3d(0,0,0) : pc_ground->normals_[ip];
+
+			Potree::Point point;
+			point.position.x = p.x();
+			point.position.y = p.y();
+			point.position.z = p.z();
+
+			point.normal.x = normal.x();
+			point.normal.y = normal.y();
+			point.normal.z = normal.z();
+
+			point.color.x = 255;
+			point.color.y = 255;
+			point.color.z = 0;
+
+			vec_points_static.push_back(point);	
+
+			Potree::Vector3<double> pt_tmp(p.x(), p.y(), p.z());
+            static_point_aabb.update(pt_tmp);
+
+			if(m_config.fdageParam.output_map){
+				std::lock_guard<std::mutex> guard(mtx);
+				pt[0].x   = r[0] * p.x() + r[1] * p.y() + r[2] * p.z() + t.x;
+				pt[0].y   = r[3] * p.x() + r[4] * p.y() + r[5] * p.z() + t.y;
+				pt[0].z   = r[6] * p.x() + r[7] * p.y() + r[8] * p.z() + t.z;
+
+				pt[0].red = 255;
+				pt[0].green = 255;
+				pt[0].blue = 0;
+				cloud_static.push_back(pt[0]);   
+			}
+		}
+
+		{// use camera traj
+			// cv::Mat pointsB(pc_nonground->points.size(), 3, CV_32F);
+			// int i = 0;
+			// int count = 0;
+			// std::vector<int>vec_select_index;
+			// for(auto &p :  pc_nonground->points){
+			// 	double x = p.x;
+			// 	double y = p.y;
+			// 	double z = p.z;
+
+			// 	pt[0].x   = r[0] * x + r[1] * y + r[2] * z + t.x;
+			// 	pt[0].y   = r[3] * x + r[4] * y + r[5] * z + t.y;
+			// 	pt[0].z    = r[6] * x + r[7] * y + r[8] * z + t.z;
+
+			// 	if(pt[0].y > -0.2 && pt[0].y < 0.2){
+			// 		vec_select_index.push_back(i);
+			// 		pointsB.at<float>(count, 0) = pt[0].x;
+			// 		pointsB.at<float>(count, 1) = pt[0].y;
+			// 		pointsB.at<float>(count, 2) = pt[0].z;
+			// 		count++;
+			// 	}
+			// 	i++;
+			// }
+			// pointsB = pointsB.rowRange(0, count).clone();
+
+			// float maxDistance = 0.3;
+			// cv::Mat indices, dists;
+			
+    		// flannIndex.knnSearch(pointsB, indices, dists, 1, cv::flann::SearchParams(64));
+			
+			// std::vector<int>vec_label(pc_nonground->points.size());
+			
+			// for (int pt_i = 0; pt_i < pointsB.rows; ++pt_i) {
+			// 	float distance = sqrt(dists.at<float>(pt_i, 0));
+			// 	if (distance <= maxDistance ) {
+			// 		vec_label[vec_select_index[pt_i]] = 1;
+			// 	}
+			// }
+
+			// pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr pc_nonground_tmp(new pcl::PointCloud<pcl::PointXYZRGBNormal>);
+			// for(int j = 0; j < vec_label.size(); j++){
+			// 	if(vec_label[j] == 1){
+			// 		if(m_config.fdageParam.output_map){
+			// 			std::lock_guard<std::mutex> guard(mtx);
+			// 			auto p =  pc_nonground->points[j];
+			// 			double x = p.x;
+			// 			double y = p.y;
+			// 			double z = p.z;
+
+			// 			pt[0].x   = r[0] * x + r[1] * y + r[2] * z + t.x;
+			// 			pt[0].y   = r[3] * x + r[4] * y + r[5] * z + t.y;
+			// 			pt[0].z    = r[6] * x + r[7] * y + r[8] * z + t.z;
+			// 			cloud_remove.push_back(pt[0]);
+			// 		}
+			// 	}else{
+			// 		pc_nonground_tmp->push_back(pc_nonground->points[j]);
+			// 	}
+			// }
+			// pc_nonground = pc_nonground_tmp;
+
+			//open3d
+			cv::Mat pointsB(static_cast<int>(pc_nonground->points_.size()), 3, CV_32F);
+			int count = 0;
+			std::vector<int> vec_select_index;
+			for (size_t pi = 0; pi < pc_nonground->points_.size(); ++pi) {
+				const auto &pp = pc_nonground->points_[pi];
+				double x = pp.x();
+				double y = pp.y();
+				double z = pp.z();
+
+				pt[0].x = r[0] * x + r[1] * y + r[2] * z + t.x;
+				pt[0].y = r[3] * x + r[4] * y + r[5] * z + t.y;
+				pt[0].z = r[6] * x + r[7] * y + r[8] * z + t.z;
+
+				if (pt[0].y > -0.2 && pt[0].y < 0.2) {
+					vec_select_index.push_back(static_cast<int>(pi));
+					pointsB.at<float>(count, 0) = static_cast<float>(pt[0].x);
+					pointsB.at<float>(count, 1) = static_cast<float>(pt[0].y);
+					pointsB.at<float>(count, 2) = static_cast<float>(pt[0].z);
+					++count;
+				}
+			}
+			pointsB = pointsB.rowRange(0, count).clone();
+
+			float maxDistance = 0.3f;
+			cv::Mat indices, dists;
+			flannIndex.knnSearch(pointsB, indices, dists, 1, cv::flann::SearchParams(64));
+
+			std::vector<int> vec_label(static_cast<int>(pc_nonground->points_.size()), 0);
+			for (int pt_i = 0; pt_i < pointsB.rows; ++pt_i) {
+				float distance = std::sqrt(dists.at<float>(pt_i, 0));
+				if (distance <= maxDistance) {
+					vec_label[vec_select_index[pt_i]] = 1;
+				}
+			}
+
+			auto pc_nonground_tmp = std::make_shared<open3d::geometry::PointCloud>();
+			for (size_t j = 0; j < vec_label.size(); ++j) {
+				if (vec_label[j] == 1) {
+					if (m_config.fdageParam.output_map) {
+						std::lock_guard<std::mutex> guard(mtx);
+						const auto &p = pc_nonground->points_[j];
+						double x = p.x();
+						double y = p.y();
+						double z = p.z();
+
+						pt[0].x = r[0] * x + r[1] * y + r[2] * z + t.x;
+						pt[0].y = r[3] * x + r[4] * y + r[5] * z + t.y;
+						pt[0].z = r[6] * x + r[7] * y + r[8] * z + t.z;
+						cloud_remove.push_back(pt[0]);
+					}
+				} else {
+					// copy point + optional color/normal
+					pc_nonground_tmp->points_.push_back(pc_nonground->points_[j]);
+					if (!pc_nonground->colors_.empty()) pc_nonground_tmp->colors_.push_back(pc_nonground->colors_[j]);
+					if (!pc_nonground->normals_.empty()) pc_nonground_tmp->normals_.push_back(pc_nonground->normals_[j]);
+				}
+			}
+			pc_nonground = pc_nonground_tmp;
+		}
+
+		// for(auto &p :  pc_nonground->points){
+		// 	double x = p.x;
+		// 	double y = p.y;
+		// 	double z = p.z;
+
+		// 	pt[0].x   = r[0] * x + r[1] * y + r[2] * z + t.x;
+		//     pt[0].y   = r[3] * x + r[4] * y + r[5] * z + t.y;
+		//     pt[0].z    = r[6] * x + r[7] * y + r[8] * z + t.z;
+
+		// 	pt[0].red = p.r;
+		// 	pt[0].green = p.g;
+		// 	pt[0].blue = p.b;
+
+		// 	Potree::Point point;
+		// 	point.position.x = x;
+		// 	point.position.y = y;
+		// 	point.position.z = z;
+
+		// 	point.normal.x = p.normal_x;
+		// 	point.normal.y = p.normal_y;
+		// 	point.normal.z = p.normal_z;
+
+		// 	point.color.x = p.r;
+		// 	point.color.y = p.g;
+		// 	point.color.z = p.b;
+
+		// 	if (!map.seenFree(pt[0]))
+		// 	{
+		// 		vec_points_static.push_back(point);		
+
+		// 		Potree::Vector3<double> pt_tmp(x, y, z);
+        //         static_point_aabb.update(pt_tmp);
+
+		// 		if(m_config.fdageParam.output_map){
+		// 			std::lock_guard<std::mutex> guard(mtx);
+		// 			cloud_static.push_back(pt[0]);
+		// 		}
+				
+		// 	}else{
+		// 		point.color.x = 255;
+		// 		point.color.y = 0;
+		// 		point.color.z = 0;
+		// 		vec_points_remove.push_back(point);
+
+		// 		if(m_config.fdageParam.output_map){
+		// 			std::lock_guard<std::mutex> guard(mtx);
+		// 			pt[0].red = 255;
+		// 			pt[0].green = 0;
+		// 			pt[0].blue = 0;
+		// 			cloud_remove.push_back(pt[0]);
+		// 		}
+		// 	}
+		// }
+
+		//open3d
+		for (size_t idx = 0; idx < pc_nonground->points_.size(); ++idx) {
+			const auto &pp = pc_nonground->points_[idx];
+			double x = pp.x();
+			double y = pp.y();
+			double z = pp.z();
+
+			pt[0].x = r[0] * x + r[1] * y + r[2] * z + t.x;
+			pt[0].y = r[3] * x + r[4] * y + r[5] * z + t.y;
+			pt[0].z = r[6] * x + r[7] * y + r[8] * z + t.z;
+
+			// color from Open3D (0..1 -> 0..255)
+			if (!pc_nonground->colors_.empty()) {
+				auto col = pc_nonground->colors_[idx];
+				pt[0].red   = static_cast<unsigned char>(std::clamp(int(std::round(col.x() * 255.0)), 0, 255));
+				pt[0].green = static_cast<unsigned char>(std::clamp(int(std::round(col.y() * 255.0)), 0, 255));
+				pt[0].blue  = static_cast<unsigned char>(std::clamp(int(std::round(col.z() * 255.0)), 0, 255));
+			} else {
+				pt[0].red = pt[0].green = pt[0].blue = 255;
+			}
+
+			Potree::Point point;
+			point.position.x = x;
+			point.position.y = y;
+			point.position.z = z;
+
+			if (!pc_nonground->normals_.empty()) {
+				auto n = pc_nonground->normals_[idx];
+				point.normal.x = n.x();
+				point.normal.y = n.y();
+				point.normal.z = n.z();
+			} else {
+				point.normal.x = point.normal.y = point.normal.z = 0;
+			}
+
+			point.color.x = pt[0].red;
+			point.color.y = pt[0].green;
+			point.color.z = pt[0].blue;
+
+			if (!map.seenFree(pt[0])) {
+				vec_points_static.push_back(point);
+				Potree::Vector3<double> pt_tmp(x, y, z);
+				static_point_aabb.update(pt_tmp);
+				if (m_config.fdageParam.output_map) {
+					std::lock_guard<std::mutex> guard(mtx);
+					cloud_static.push_back(pt[0]);
+				}
+			} else {
+				point.color.x = 255;
+				point.color.y = 0;
+				point.color.z = 0;
+				vec_points_remove.push_back(point);
+				if (m_config.fdageParam.output_map) {
+					std::lock_guard<std::mutex> guard(mtx);
+					pt[0].red = 255;
+					pt[0].green = 0;
+					pt[0].blue = 0;
+					cloud_remove.push_back(pt[0]);
+				}
+			}
+		}
+
+		if( m_config.fdageParam.replaceInputPly)
+		{
+			    int  floor_id = ele.floor_id;
+				string ply_path = m_ply_dir + std::to_string(floor_id) + "_" + ele.uuid + ".ply";
+				
+				//ufo::writePointCloudPLY_bin(ply_path, vec_points_static);
+
+                string las_path = m_new_laz_dir + std::to_string(floor_id) + "_" + ele.uuid + "_depth.laz";
+				std::cout << "replaceInputFile: "<< las_path << std::endl;
+				
+                ufo::writePointCloudLAS(las_path, vec_points_static, static_point_aabb);
+		}
+		
+	}
+
+	indicators::show_console_cursor(true);
+	std::cout << "\033[0m\n[LOG] Step 3: Finished Processing data. Start saving map... " << std::endl;
+	// bar.is_completed();
+	if (!m_config.propagate) {
+		timing[3].start("Propagate");
+		map.propagateModified();
+		timing[3].stop();
+	}
+
+	timing[4].start("Cluster");
+	if (m_config.clustering.cluster) {
+		cluster(map, m_config.clustering);
+	}
+	timing[4].stop();
+
+	std::cout << "build map cost: " << seconds_map << "s" << std::endl;
+	auto end = high_resolution_clock::now();
+	long long duration = duration_cast<milliseconds>(end - begin_t).count();
+	float seconds = duration / 1'000.0f;
+	std::cout << "cost total time: " << seconds << "s" << std::endl;
+
+	if(m_config.fdageParam.output_map)
+	{
+		std::cout << "output map begin" << std::endl;
+		ufo::Color color_remove;
+		color_remove.red = 255;
+		color_remove.green = 0;
+		color_remove.blue = 0;
+		std::string save_remove_name = "_remove.ply";
+		std::string save_static_name = "_static.ply";
+		std::string save_ground_name = "_ground.ply";
+		std::string save_noise_name = "_noise.ply";
+
+		writePointCloudPLY_downsample_remove(m_data_root +  (m_config.output.filename + save_remove_name ), cloud_remove, 0.1, 0.1, 0.1, color_remove);
+		ufo::writePointCloudPLY_downsample(m_data_root +  (m_config.output.filename + save_static_name), cloud_static, 0.1, 0.1, 0.1);
+		ufo::writePointCloudPLY_downsample(m_data_root +  (m_config.output.filename + save_ground_name), cloud_acc_ground, 0.1, 0.1, 0.1);
+		ufo::writePointCloudPLY_downsample(m_data_root +  (m_config.output.filename + save_noise_name), cloud_acc_noise, 0.1, 0.1, 0.1);
+
+		std::string save_camera_traj = "_camera_traj.ply";
+		ufo::writePointCloudPLY_downsample(m_data_root +  (m_config.output.filename + save_camera_traj), cloud_camera_traj, 0.01, 0.01, 0.01);
+				
+		std::cout << "output map end" << std::endl;
+	}
+
+	// std::cout << "build map cost: " << seconds_map << "s" << std::endl;
+	// auto end = high_resolution_clock::now();
+	// long long duration = duration_cast<milliseconds>(end - begin_t).count();
+	// float seconds = duration / 1'000.0f;
+	// std::cout << "cost total time: " << seconds << "s" << std::endl;
+}
+
+int main(int argc, char* argv[])
+{
+    std::string data_root = argv[1];
+	std::string config_file_path = argv[2];
+
+	 CleanMap clean_map = CleanMap(data_root, config_file_path);
+     clean_map.init();
+	 clean_map.run();
+
+	 return 0;
+}
+

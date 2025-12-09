@@ -1,0 +1,28 @@
+liblzf (3.6-4) unstable; urgency=medium
+
+  * Update maintainer email address
+  * Bump Standards-Version to 4.6.2
+  * Bump minimum CMake version for autopkgtest
+
+ -- Timo Röhling <roehling@debian.org>  Tue, 27 Jun 2023 23:08:47 +0200
+
+liblzf (3.6-3) unstable; urgency=medium
+
+  * Update maintainer email address
+  * Bump debhelper to 13
+  * Bump Standards-Version to 4.5.1
+
+ -- Timo Röhling <timo@gaussglocke.de>  Sun, 29 Nov 2020 10:16:57 +0100
+
+liblzf (3.6-2) unstable; urgency=medium
+
+  * Update Vcs-* info
+  * Fix typo in package description
+
+ -- Timo Röhling <timo.roehling@fkie.fraunhofer.de>  Mon, 20 Apr 2020 14:38:35 +0200
+
+liblzf (3.6-1) unstable; urgency=medium
+
+  * Initial release (Closes: #953632)
+
+ -- Timo Röhling <timo.roehling@fkie.fraunhofer.de>  Wed, 11 Mar 2020 16:04:41 +0100

@@ -1,0 +1,3 @@
+CMakeLists.txt
+liblzf-config.cmake.in
+liblzf.pc.in

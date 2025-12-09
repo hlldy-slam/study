@@ -1,0 +1,2 @@
+Tests: build-c build-cpp
+Depends: liblzf-dev, cmake, gcc | c-compiler, g++ | c++-compiler

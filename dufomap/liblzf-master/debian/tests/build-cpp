@@ -1,0 +1,51 @@
+#!/bin/bash
+set -e
+
+cd "$AUTOPKGTEST_TMP"
+
+cat > CMakeLists.txt << EOF
+cmake_minimum_required(VERSION 3.13...3.25)
+project(lzf_test LANGUAGES C CXX)
+ 
+find_package(liblzf REQUIRED)
+add_executable(lzf_test_linked lzf_test.cpp)
+target_link_libraries(lzf_test_linked liblzf::liblzf)
+
+add_executable(lzf_test_embedded lzf_test.cpp)
+target_link_libraries(lzf_test_embedded liblzf::embed)
+
+add_executable(lzf_test_oldschool lzf_test.cpp \${liblzf_SOURCES})
+target_include_directories(lzf_test_oldschool PRIVATE \${liblzf_INCLUDE_DIRS})
+EOF
+cat > lzf_test.cpp << EOF
+#include <lzf.h>
+#include <cassert>
+#include <cstring>
+#include <iostream>
+
+const char in[] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+char buf[128];
+char out[128];
+
+int main (int argc, char** argv)
+{
+	unsigned sz_buf, sz_out;
+	sz_buf  = lzf_compress(in, sizeof(in), buf, sizeof(buf));
+	assert(sz_buf > 0);	
+	sz_out = lzf_decompress(buf, sz_buf, out, sizeof(out));
+	assert(sz_out == sizeof(in));
+	assert(strcmp(in, out) == 0);
+	std::cout << "OK" << std::endl;
+	return 0;
+}
+EOF
+echo '$' cmake .
+cmake .
+echo '$' make VERBOSE=ON
+make VERBOSE=ON
+echo '$' ./lzf_test_linked
+./lzf_test_linked
+echo '$' ./lzf_test_embedded
+./lzf_test_embedded
+echo '$' ./lzf_test_oldschool
+./lzf_test_oldschool

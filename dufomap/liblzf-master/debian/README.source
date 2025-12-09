@@ -1,0 +1,29 @@
+liblzf
+======
+
+I.
+--
+
+I replaced the autoconf build system with CMake; the relevant files can be
+found in debian/extras and will be copied into the source tree by debian/rules
+right before package configuration occurs. 
+
+
+II.
+---
+
+The source distribution is signed with OpenBSD signify. The public key can be
+found in debian/signing-key.pub. Unfortunately, uscan cannot automatically
+verify this type of signature (yet).
+
+
+III.
+----
+
+The ABI of this library is very simple and thus very stable, basically unchanged since
+the very first release. However, the internal compression has evolved a bit, thus I
+am conservative and declare the library symbols compatible back to version 1.5 at most.
+Incidentally, this is when the new LZF_VERSION macro was added to lzf.h, and its 
+value remained unchanged since.
+
+-- Timo Röhling <timo.roehling@fkie.fraunhofer.de>  Wed 11, Mar 2020 11:06:11 +0100

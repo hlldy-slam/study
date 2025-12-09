@@ -1,0 +1,19 @@
+liblzf CMake Targets and Embedding the library
+==============================================
+
+The debianized version of liblzf exports two CMake targets, which can be
+imported with `find_package(liblzf)`:
+
+    liblzf::liblzf  --  link against the shared library
+    liblzf::embed   --  embed the lzf library in your own executable
+
+The latter target avoids the public shared object dependency and is the
+preferred way to use the library according to the upstream author. However, you
+need to re-compile your project to update the library, e.g. in case of security
+vulnerabilities. You should carefully consider which option suits your project
+best.
+
+The CMake configuration also sets liblzf_INCLUDE_DIRS and liblzf_SOURCES to
+the include path and the library source files, respectively.
+
+ -- Timo Röhling <timo.roehling@fkie.fraunhofer.de>  Wed, 11 Mar 2020 16:04:41 +0100
